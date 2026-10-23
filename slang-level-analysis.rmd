@@ -1,0 +1,1086 @@
+---
+title: "slang-level-analysis"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(fixest)
+library(ggcorrplot)
+library(purrr)
+library(lmtest)
+library(zoo)
+library(e1071)
+```
+
+---
+
+# Part 1 — Data Loading and Preprocessing
+
+The data contains slang-level adoption rates. Within each time window and subreddit
+there are multiple slang terms. The forecast horizon is defined in calendar periods,
+not row positions, and targets are joined by key. We keep only slang-subreddit pairs
+whose eligible predictor sequence is **continuous** (no gaps).
+
+## 1.1 Load and validate
+
+```{r load}
+df_raw <- read.csv("./slang-level-df.csv")
+
+KEY_VARS <- c("subreddit", "slang", "time_idx")
+COUNT_VARS <- c(
+  "active_user_count", "active_adopter_count",
+  "new_users_count", "new_adopter_count"
+)
+COVARIATES_RAW <- c(
+  "mean_betweenness", "mean_degree",
+  "semantic_dispersion", "effective_topics"
+)
+
+# The models below are compared on one explicit common sample. If a model-specific
+# sample is desired, define its required covariates separately instead of using a
+# blanket drop_na() across the whole data frame.
+REQUIRED_CURRENT_VARS <- c(KEY_VARS, "time", COUNT_VARS, COVARIATES_RAW)
+
+duplicate_keys <- df_raw %>%
+  count(across(all_of(KEY_VARS)), name = "n") %>%
+  filter(n > 1)
+stopifnot(nrow(duplicate_keys) == 0)
+
+# Each month must map one-to-one to time_idx, and the index must advance monthly.
+time_map <- df_raw %>%
+  distinct(time, time_idx) %>%
+  arrange(time_idx) %>%
+  mutate(
+    parsed_month = as.Date(paste0(time, "-01")),
+    month_number = as.integer(format(parsed_month, "%Y")) * 12L +
+      as.integer(format(parsed_month, "%m"))
+  )
+stopifnot(
+  nrow(time_map) == n_distinct(time_map$time),
+  nrow(time_map) == n_distinct(time_map$time_idx),
+  !anyNA(time_map$parsed_month),
+  all(diff(time_map$time_idx) == diff(time_map$month_number))
+)
+
+# Counts used as outcomes or exposure components must be finite, non-negative integers.
+for (v in COUNT_VARS) {
+  stopifnot(
+    is.numeric(df_raw[[v]]),
+    all(is.finite(df_raw[[v]])),
+    all(df_raw[[v]] >= 0),
+    all(df_raw[[v]] == floor(df_raw[[v]]))
+  )
+}
+
+df_raw %>% head()
+```
+
+
+## 1.2 Create calendar-aligned targets and exposure
+
+The stated outcome is one calendar period ahead, so the default horizon is 1.
+Change `FORECAST_HORIZON` to 22 if a 22-month outcome is intended; the keyed join
+will remain correctly aligned even when a pair has missing observations.
+
+```{r targets_and_exposure}
+FORECAST_HORIZON <- 1L
+stopifnot(length(FORECAST_HORIZON) == 1, FORECAST_HORIZON >= 1)
+
+target_lookup <- df_raw %>%
+  transmute(
+    subreddit,
+    slang,
+    target_time_idx = time_idx,
+    target_time = time,
+    target_new_adopters_count = new_adopter_count,
+    target_active_adopters_count = active_adopter_count
+  )
+
+df_prepared <- df_raw %>%
+  mutate(
+    target_time_idx = time_idx + FORECAST_HORIZON,
+    eligible_user_exposure =
+      active_user_count - active_adopter_count +
+      new_users_count - new_adopter_count
+  ) %>%
+  left_join(
+    target_lookup,
+    by = c("subreddit", "slang", "target_time_idx")
+  )
+
+invalid_exposure_n <- df_prepared %>%
+  summarise(n = sum(!is.finite(eligible_user_exposure) |
+                      eligible_user_exposure <= 0, na.rm = TRUE)) %>%
+  pull(n)
+cat("Rows with invalid exposure before filtering:", invalid_exposure_n, "\n")
+```
+
+
+## 1.3 Define the eligible common sample
+
+```{r}
+df_eligible <- df_prepared %>%
+  drop_na(all_of(REQUIRED_CURRENT_VARS)) %>%
+  filter(
+    is.finite(eligible_user_exposure),
+    eligible_user_exposure > 0
+  )
+
+cat("Input rows:", nrow(df_raw), "\n")
+cat("Rows in common complete-case/exposure sample:", nrow(df_eligible), "\n")
+```
+
+
+## 1.4 Keep only no-gap pairs
+
+Continuity is evaluated before rows without a future target are removed. This prevents
+the target-horizon truncation from hiding gaps at the end of a pair's history.
+
+```{r continuity}
+slang_continuity <- df_eligible %>%
+  group_by(slang, subreddit) %>%
+  summarise(
+    n_periods = n_distinct(time_idx),
+    span      = max(time_idx) - min(time_idx) + 1,
+    has_gap   = n_periods != span,
+    .groups   = "drop"
+  )
+
+cat("Gap summary (TRUE = has a gap):\n")
+print(table(slang_continuity$has_gap))
+
+continuous_pairs <- slang_continuity %>%
+  filter(!has_gap) %>%
+  select(slang, subreddit)
+
+df_nogaps <- df_eligible %>%
+  semi_join(continuous_pairs, by = c("slang", "subreddit")) %>%
+  drop_na(
+    target_time, target_new_adopters_count,
+    target_active_adopters_count
+  )
+
+stopifnot(all(
+  df_nogaps$target_time_idx - df_nogaps$time_idx == FORECAST_HORIZON
+))
+
+cat("\nSlangs before:", n_distinct(df_eligible$slang),
+    "  after:", n_distinct(df_nogaps$slang), "\n")
+cat("Rows  before:", nrow(df_eligible),
+    "  after:", nrow(df_nogaps), "\n")
+```
+
+## 1.5 Remove singleton groups for the fixed effects actually modeled
+
+The models use `subreddit ^ time_idx` and `slang` fixed effects. Singleton removal
+is therefore based on those groups and is repeated until no new singleton is created.
+
+```{r fixed_effect_sample}
+remove_fe_singletons <- function(data) {
+  repeat {
+    n_before <- nrow(data)
+
+    data <- data %>%
+      add_count(subreddit, time_idx, name = ".n_subreddit_time") %>%
+      add_count(slang, name = ".n_slang") %>%
+      filter(.n_subreddit_time > 1, .n_slang > 1) %>%
+      select(-.n_subreddit_time, -.n_slang)
+
+    if (nrow(data) == n_before) return(data)
+  }
+}
+
+n_before_fe_filter <- nrow(df_nogaps)
+df_nogaps <- remove_fe_singletons(df_nogaps)
+
+cat("Rows removed as fixed-effect singletons:",
+    n_before_fe_filter - nrow(df_nogaps), "\n")
+cat("Final prepared rows:", nrow(df_nogaps), "\n")
+cat("Final subreddits:", n_distinct(df_nogaps$subreddit), "\n")
+```
+
+---
+
+# Part 2 — Exploratory Analysis and Transformations
+
+## 2.1  Distribution of raw covariates
+
+```{r raw_distributions}
+par(mfrow = c(3, 3))
+for (v in COVARIATES_RAW) {
+  hist(df_nogaps[[v]], main = v, breaks = 50, xlab = "")
+}
+
+cat("\nSkewness and mean/median ratio:\n")
+sapply(COVARIATES_RAW, function(v) {
+  c(
+    skew            = skewness(df_nogaps[[v]], na.rm = TRUE),
+    mean_med_ratio  = mean(df_nogaps[[v]], na.rm = TRUE) /
+                      median(df_nogaps[[v]], na.rm = TRUE)
+  )
+})
+```
+
+## 2.2 Transform and scale the final analysis sample
+
+The raw variables remain available in `df_nogaps`. Network covariates are log-transformed
+and all four covariates are standardized only after the final analysis sample is fixed.
+
+```{r transform_and_scale}
+df_model <- df_nogaps %>%
+  mutate(
+    mean_degree = log1p(mean_degree),
+    mean_betweenness = log1p(mean_betweenness)
+  ) %>%
+  mutate(across(all_of(COVARIATES_RAW), ~ as.numeric(scale(.x))))
+```
+
+## 2.3 Multicollinearity plot
+
+```{r corr_plot}
+CORR_VARS <- c(
+  "mean_betweenness", "mean_degree",
+  "semantic_dispersion", "effective_topics"
+)
+
+
+feature_mat <- cor(df_model[, CORR_VARS], use = "complete.obs")
+
+ggcorrplot(
+  feature_mat,
+  method    = "square",
+  lab_size  = 2.5,
+  type      = "lower",
+  lab       = TRUE,
+  title     = "Correlation Matrix — scaled covariates (no-gap sample)"
+)
+```
+
+---
+
+# Part 3 — Model Fitting
+
+All models use the same no-gap, transformed and scaled dataset (`df_model`).
+
+- **m0**: model with intercept only
+- **m1**: model with network features only
+- **m2**: model with network features and semantic dispersion
+- **m3**: model with network features and topic intensity
+- **m4**: model with network features and both linguistic features
+- **m5**: model with linguistic features only
+
+
+```{r model_m1}
+m1 <- fenegbin(
+  target_new_adopters_count ~
+    mean_betweenness  + mean_degree | subreddit ^ time_idx + slang,
+  offset  = ~log(eligible_user_exposure),
+  data    = df_model,
+  cluster = ~subreddit
+)
+
+summary(m1)
+```
+
+```{r model_m0}
+
+df_used <- df_model[obs(m1), ]
+df_removed <- df_model[-obs(m1), ]
+
+m0 <- fenegbin(
+  target_new_adopters_count ~ 1,
+  data    = df_used,
+  cluster = ~subreddit,
+  offset  = ~log(eligible_user_exposure)
+)
+
+summary(m0)
+```
+
+```{r model_m2}
+m2 <- fenegbin(
+  target_new_adopters_count ~
+    mean_betweenness  + mean_degree + semantic_dispersion |
+    subreddit ^ time_idx + slang,
+  data    = df_used,
+  offset  = ~log(eligible_user_exposure),
+  cluster = ~subreddit
+)
+
+summary(m2)
+```
+
+```{r model_m3}
+m3 <- fenegbin(
+  target_new_adopters_count ~
+    mean_betweenness + mean_degree + effective_topics |
+    subreddit ^ time_idx + slang,
+  data    = df_used,
+  offset  = ~log(eligible_user_exposure),
+  cluster = ~subreddit
+)
+
+summary(m3)
+```
+
+```{r model_m4}
+m4 <- fenegbin(
+  target_new_adopters_count ~
+    mean_betweenness  + mean_degree + effective_topics + semantic_dispersion |
+    subreddit ^ time_idx + slang,
+  data    = df_used,
+  offset  = ~log(eligible_user_exposure),
+  cluster = ~subreddit
+)
+
+summary(m4)
+```
+
+```{r model_m5}
+m5 <- fenegbin(
+  target_new_adopters_count ~
+    effective_topics + semantic_dispersion |
+    subreddit ^ time_idx + slang,
+  data    = df_used,
+  offset  = ~log(eligible_user_exposure),
+  cluster = ~subreddit
+)
+
+summary(m5)
+```
+
+
+
+```{r lr_test}
+lrtest(m0, m1, m2, m3, m4)
+```
+
+## 3.1 Monte Carlo robustness to LLM classification error
+
+This analysis treats the observed future `new_adopter_count` as an imperfect binary
+classification aggregated to a count. In the analysis-ready data, that future count is
+stored as `target_new_adopters_count`; the current-period `new_adopter_count` and every
+covariate remain unchanged. The simulation uses the same rows, offset, fixed effects,
+and clustered negative-binomial specification as `m4`.
+
+Let $q$ be the observed prevalence. The estimated true prevalence $p$ is first
+calculated using the Rogan--Gladen correction:
+
+\[
+p = \frac{q + Sp - 1}{Se + Sp - 1}.
+\]
+
+Given sensitivity $Se$, specificity $Sp$, and corrected prevalence $p$, the
+probability that an observed adopter is truly an adopter is
+
+\[
+PPV = \frac{Se\,p}{Se\,p + (1-Sp)(1-p)}.
+\]
+
+Among observed non-adopters, the corresponding probability of being a false negative is
+
+\[
+P(T=1 \mid O=0) =
+\frac{(1-Se)p}{(1-Se)p + Sp(1-p)}.
+\]
+
+### Validate classification parameters
+
+```{r mc_validate_parameters}
+validate_classification_parameters <- function(
+    sensitivity, specificity, prevalence) {
+  parameters <- c(
+    sensitivity = sensitivity,
+    specificity = specificity,
+    prevalence = prevalence
+  )
+
+  if (anyNA(parameters)) {
+    stop(
+      paste0(
+        "Monte Carlo analysis cannot run: set SENSITIVITY, SPECIFICITY, ",
+        "and OBSERVED_PREVALENCE to numeric values in [0, 1]."
+      ),
+      call. = FALSE
+    )
+  }
+
+  if (!is.numeric(parameters) || any(!is.finite(parameters)) ||
+      any(parameters < 0 | parameters > 1)) {
+    stop(
+      "SENSITIVITY, SPECIFICITY, and OBSERVED_PREVALENCE must all be finite numeric values in [0, 1].",
+      call. = FALSE
+    )
+  }
+
+  invisible(parameters)
+}
+
+# Monte Carlo classification-error inputs. Replace NA with validated values
+SENSITIVITY <- 0.9344
+SPECIFICITY <- 0.9294
+OBSERVED_PREVALENCE <- 0.1841
+
+N_MONTE_CARLO_SIMULATIONS <- 100L
+MONTE_CARLO_SEED <- 20260830L
+
+validate_classification_parameters(
+  SENSITIVITY, SPECIFICITY, OBSERVED_PREVALENCE
+)
+```
+
+### Modular simulation and model functions
+
+```{r mc_functions}
+calculate_corrected_prevalence <- function(
+    sensitivity, specificity, observed_prevalence) {
+  denominator <- sensitivity + specificity - 1
+
+  if (denominator <= 0) {
+    stop(
+      "Prevalence correction requires SENSITIVITY + SPECIFICITY > 1.",
+      call. = FALSE
+    )
+  }
+
+  corrected_prevalence <-
+    (observed_prevalence + specificity - 1) / denominator
+
+  if (corrected_prevalence < 0 || corrected_prevalence > 1) {
+    stop(
+      paste0(
+        "The supplied sensitivity, specificity, and observed prevalence are ",
+        "incompatible: the corrected prevalence is ",
+        round(corrected_prevalence, 4), "."
+      ),
+      call. = FALSE
+    )
+  }
+
+  corrected_prevalence
+}
+
+calculate_prevalence_adjusted_ppv <- function(
+    sensitivity, specificity, prevalence) {
+  numerator <- sensitivity * prevalence
+  denominator <- numerator + (1 - specificity) * (1 - prevalence)
+
+  if (denominator <= 0) {
+    stop(
+      "PPV is undefined for the supplied sensitivity, specificity, and prevalence.",
+      call. = FALSE
+    )
+  }
+
+  numerator / denominator
+}
+
+simulate_corrected_adopter_counts <- function(
+    observed_new_adopter_count,
+    eligible_population,
+    sensitivity,
+    specificity,
+    prevalence,
+    ppv) {
+  if (length(observed_new_adopter_count) != length(eligible_population)) {
+    stop("Observed counts and eligible populations must have equal length.", call. = FALSE)
+  }
+  if (anyNA(observed_new_adopter_count) || anyNA(eligible_population) ||
+      any(observed_new_adopter_count < 0) || any(eligible_population < 0)) {
+    stop("Observed counts and eligible populations must be non-negative and non-missing.", call. = FALSE)
+  }
+
+  observed_count <- as.integer(round(observed_new_adopter_count))
+  eligible_count <- as.integer(floor(eligible_population))
+
+  # A classified-positive count cannot exceed the population being classified.
+  # This cap affects only the simulated copy, never the original analysis data.
+  observed_count_for_simulation <- pmin(observed_count, eligible_count)
+  observed_negative_count <- eligible_count - observed_count_for_simulation
+
+  true_positive_count <- rbinom(
+    n = length(observed_count_for_simulation),
+    size = observed_count_for_simulation,
+    prob = ppv
+  )
+
+  false_negative_numerator <- (1 - sensitivity) * prevalence
+  false_negative_denominator <-
+    false_negative_numerator + specificity * (1 - prevalence)
+  false_negative_probability <- if (false_negative_denominator == 0) {
+    0
+  } else {
+    false_negative_numerator / false_negative_denominator
+  }
+
+  false_negative_count <- rbinom(
+    n = length(observed_negative_count),
+    size = observed_negative_count,
+    prob = false_negative_probability
+  )
+
+  corrected_count <- true_positive_count + false_negative_count
+  corrected_count <- pmax(0L, pmin(corrected_count, eligible_count))
+
+  stopifnot(
+    all(corrected_count >= 0),
+    all(corrected_count <= eligible_count)
+  )
+
+  corrected_count
+}
+
+fit_adoption_regression <- function(data) {
+  fenegbin(
+    target_new_adopters_count ~
+      mean_betweenness + mean_degree + effective_topics + semantic_dispersion |
+      subreddit ^ time_idx + slang,
+    data = data,
+    offset = ~log(eligible_user_exposure),
+    cluster = ~subreddit
+  )
+}
+
+summarize_monte_carlo_results <- function(
+    simulation_results, original_model, covariates) {
+  original_table <- coeftable(original_model)
+  missing_original_terms <- setdiff(covariates, rownames(original_table))
+  if (length(missing_original_terms) > 0) {
+    stop(
+      paste("Original model is missing:", paste(missing_original_terms, collapse = ", ")),
+      call. = FALSE
+    )
+  }
+
+  original_coefficients <- tibble(
+    term = covariates,
+    original_coefficient = original_table[covariates, 1]
+  )
+
+  simulation_results %>%
+    left_join(original_coefficients, by = "term") %>%
+    group_by(term, original_coefficient) %>%
+    summarise(
+      median_simulated_coefficient = median(estimate),
+      simulated_q025 = quantile(estimate, 0.025),
+      simulated_q975 = quantile(estimate, 0.975),
+      proportion_same_sign = mean(sign(estimate) == sign(original_coefficient)),
+      proportion_p_below_005 = mean(p_value < 0.05),
+      .groups = "drop"
+    )
+}
+```
+
+### Run 100 simulations
+
+```{r mc_run}
+MC_COVARIATES <- c(
+  "mean_betweenness", "mean_degree", "mean_local_clustering",
+  "semantic_dispersion", "effective_topics"
+)
+MODEL_COVARIATES <- c(
+  "mean_betweenness", "mean_degree",
+  "semantic_dispersion", "effective_topics"
+)
+
+stopifnot(all(MC_COVARIATES %in% names(df_used)))
+
+ESTIMATED_TRUE_PREVALENCE <- calculate_corrected_prevalence(
+  SENSITIVITY, SPECIFICITY, OBSERVED_PREVALENCE
+)
+
+MC_PPV <- calculate_prevalence_adjusted_ppv(
+  SENSITIVITY, SPECIFICITY, ESTIMATED_TRUE_PREVALENCE
+)
+
+false_negative_numerator <-
+  (1 - SENSITIVITY) * ESTIMATED_TRUE_PREVALENCE
+false_negative_denominator <-
+  false_negative_numerator +
+  SPECIFICITY * (1 - ESTIMATED_TRUE_PREVALENCE)
+MC_FALSE_NEGATIVE_PROBABILITY <- if (false_negative_denominator == 0) {
+  0
+} else {
+  false_negative_numerator / false_negative_denominator
+}
+
+cat(
+  "Estimated true prevalence after misclassification correction:",
+  round(ESTIMATED_TRUE_PREVALENCE, 4), "\n"
+)
+cat("Monte Carlo PPV:", round(MC_PPV, 4), "\n")
+cat(
+  "False-negative probability among observed negatives:",
+  round(MC_FALSE_NEGATIVE_PROBABILITY, 4), "\n"
+)
+cat(
+  "Rows whose observed future count exceeds the eligible population and will be capped in simulated copies:",
+  sum(df_used$target_new_adopters_count > df_used$eligible_user_exposure), "\n"
+)
+
+set.seed(MONTE_CARLO_SEED)
+
+monte_carlo_results <- map_dfr(
+  seq_len(N_MONTE_CARLO_SIMULATIONS),
+  function(simulation_id) {
+    simulated_data <- df_used
+    simulated_data$target_new_adopters_count <-
+      simulate_corrected_adopter_counts(
+        observed_new_adopter_count = df_used$target_new_adopters_count,
+        eligible_population = df_used$eligible_user_exposure,
+        sensitivity = SENSITIVITY,
+        specificity = SPECIFICITY,
+        prevalence = ESTIMATED_TRUE_PREVALENCE,
+        ppv = MC_PPV
+      )
+
+    # Explicitly verify that current-period counts and all covariates are untouched.
+    stopifnot(
+      identical(simulated_data$new_adopter_count, df_used$new_adopter_count),
+      all(vapply(
+        MC_COVARIATES,
+        function(v) identical(simulated_data[[v]], df_used[[v]]),
+        logical(1)
+      ))
+    )
+
+    simulated_model <- tryCatch(
+      fit_adoption_regression(simulated_data),
+      error = function(e) {
+        stop(
+          sprintf("Monte Carlo simulation %d failed: %s", simulation_id, e$message),
+          call. = FALSE
+        )
+      }
+    )
+
+    simulation_table <- coeftable(simulated_model)
+    missing_terms <- setdiff(MODEL_COVARIATES, rownames(simulation_table))
+    if (length(missing_terms) > 0) {
+      stop(
+        sprintf(
+          "Simulation %d is missing coefficient(s): %s",
+          simulation_id, paste(missing_terms, collapse = ", ")
+        ),
+        call. = FALSE
+      )
+    }
+
+    if (simulation_id %% 25L == 0L) {
+      cat("Completed", simulation_id, "of", N_MONTE_CARLO_SIMULATIONS, "simulations\n")
+    }
+
+    tibble(
+      simulation = simulation_id,
+      term = MODEL_COVARIATES,
+      estimate = simulation_table[MODEL_COVARIATES, 1],
+      std_error = simulation_table[MODEL_COVARIATES, 2],
+      p_value = simulation_table[MODEL_COVARIATES, 4]
+    )
+  }
+)
+
+stopifnot(
+  n_distinct(monte_carlo_results$simulation) == N_MONTE_CARLO_SIMULATIONS,
+  nrow(monte_carlo_results) ==
+    N_MONTE_CARLO_SIMULATIONS * length(MODEL_COVARIATES)
+)
+```
+
+### Monte Carlo robustness summary
+
+```{r mc_summary}
+monte_carlo_summary <- summarize_monte_carlo_results(
+  monte_carlo_results,
+  original_model = m4,
+  covariates = MODEL_COVARIATES
+)
+
+knitr::kable(
+  monte_carlo_summary,
+  digits = 3,
+  col.names = c(
+    "Covariate", "Original beta", "Median simulated beta",
+    "2.5% quantile", "97.5% quantile", "Same-sign proportion",
+    "Proportion p < 0.05"
+  ),
+  caption = "Monte Carlo robustness to LLM classification error"
+)
+```
+
+---
+
+# Part 4 — Coefficient Paths Across Forecast Horizons
+
+This section estimates the full model (`m4`) separately for outcomes 1 through 30
+calendar months ahead. To make coefficients comparable across horizons, every model
+uses the same balanced set of current-period observations and the same covariate
+standardization. The outcome changes with the horizon; the predictors and exposure do not.
+
+## 4.1 Construct a balanced multi-horizon sample
+
+```{r horizon_sample}
+MAX_HORIZON <- 30L
+HORIZONS <- seq_len(MAX_HORIZON)
+
+CURRENT_MODEL_VARS <- c(REQUIRED_CURRENT_VARS, "eligible_user_exposure")
+
+balanced_candidates <- df_eligible %>%
+  semi_join(continuous_pairs, by = c("slang", "subreddit")) %>%
+  select(all_of(CURRENT_MODEL_VARS))
+
+# Identify current observations that have an exactly keyed outcome at every horizon.
+horizon_availability <- balanced_candidates %>%
+  select(all_of(KEY_VARS)) %>%
+  crossing(horizon = HORIZONS) %>%
+  mutate(target_time_idx = time_idx + horizon) %>%
+  inner_join(
+    target_lookup %>% select(subreddit, slang, target_time_idx),
+    by = c("subreddit", "slang", "target_time_idx")
+  )
+
+balanced_keys <- horizon_availability %>%
+  count(across(all_of(KEY_VARS)), name = "n_horizons") %>%
+  filter(n_horizons == length(HORIZONS)) %>%
+  select(all_of(KEY_VARS))
+
+balanced_current <- balanced_candidates %>%
+  semi_join(balanced_keys, by = KEY_VARS) %>%
+  remove_fe_singletons()
+
+# Transform and standardize once so a one-unit change has the same meaning at every horizon.
+balanced_current_model <- balanced_current %>%
+  mutate(
+    mean_degree = log1p(mean_degree),
+    mean_betweenness = log1p(mean_betweenness)
+  ) %>%
+  mutate(across(all_of(COVARIATES_RAW), ~ as.numeric(scale(.x))))
+
+horizon_model_data <- balanced_current_model %>%
+  crossing(horizon = HORIZONS) %>%
+  mutate(target_time_idx = time_idx + horizon) %>%
+  inner_join(
+    target_lookup,
+    by = c("subreddit", "slang", "target_time_idx")
+  )
+
+stopifnot(
+  nrow(horizon_model_data) == nrow(balanced_current_model) * length(HORIZONS),
+  all(horizon_model_data$target_time_idx - horizon_model_data$time_idx ==
+        horizon_model_data$horizon)
+)
+
+cat("Balanced current-period observations per horizon:",
+    nrow(balanced_current_model), "\n")
+```
+
+## 4.2 Fit the full model at each horizon
+
+```{r horizon_models}
+fit_horizon_model <- function(h) {
+  data_h <- horizon_model_data %>% filter(horizon == h)
+
+  fit <- fenegbin(
+    target_new_adopters_count ~
+      mean_betweenness + mean_degree + effective_topics + semantic_dispersion |
+      subreddit ^ time_idx + slang,
+    data = data_h,
+    offset = ~log(eligible_user_exposure),
+    cluster = ~subreddit
+  )
+
+  coefficient_table <- coeftable(fit)
+
+  beta_table <- tibble(
+    horizon = h,
+    term = rownames(coefficient_table),
+    estimate = coefficient_table[, 1],
+    std_error = coefficient_table[, 2],
+    conf_low = estimate - qnorm(0.975) * std_error,
+    conf_high = estimate + qnorm(0.975) * std_error,
+    observations = nobs(fit)
+  ) %>%
+    filter(term %in% COVARIATES_RAW)
+
+  list(model = fit, betas = beta_table)
+}
+
+horizon_results <- set_names(HORIZONS) %>%
+  map(fit_horizon_model)
+
+# Named model list for inspecting any individual horizon, e.g. summary(horizon_fits[["15"]]).
+horizon_fits <- horizon_results %>% map("model")
+horizon_betas <- horizon_results %>% map_dfr("betas")
+
+horizon_betas
+```
+
+## 4.3 Plot beta estimates by forecast horizon
+
+```{r horizon_beta_plot, fig.width=14, fig.height=7}
+# Define the labels and plotting data before using them below.
+TERM_LABELS <- c(
+  mean_betweenness = "Betweenness Centrality",
+  mean_degree = "Degree Centrality",
+  effective_topics = "Effective Topics",
+  semantic_dispersion = "Semantic Dispersion"
+)
+FACET_ORDER <- names(TERM_LABELS)
+
+horizon_betas_plot_data <- horizon_betas %>%
+  mutate(term = factor(term, levels = FACET_ORDER)) %>%
+  arrange(term, horizon)
+
+horizon_beta_plot <- ggplot(
+  horizon_betas_plot_data,
+  aes(x = horizon, y = estimate)
+) +
+  geom_hline(
+    yintercept = 0,
+    colour = "grey60",
+    linetype = "dashed"
+  ) +
+  geom_ribbon(
+    aes(ymin = conf_low, ymax = conf_high),
+    fill = "#2C7FB8",
+    alpha = 0.16
+  ) +
+  geom_line(
+    colour = "#2C7FB8",
+    linewidth = 1.2
+  ) +
+  geom_point(
+    colour = "#2C7FB8",
+    size = 2.8
+  ) +
+  facet_wrap(
+    ~term,
+    scales = "free_y",
+    ncol = 2,
+    labeller = as_labeller(TERM_LABELS)
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 6),
+    expand = expansion(mult = c(0.03, 0.05))
+  ) +
+  labs(
+    title = "Coefficient Paths Across Forecast Horizons",
+    subtitle = "Full negative-binomial model; ribbons show 95% confidence intervals",
+    x = "Forecast Horizon (months)",
+    y = expression(beta)
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    panel.grid.minor = element_blank(),
+
+    plot.title = element_text(
+      size = 24,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      size = 18
+    ),
+
+    strip.text = element_text(
+      size = 20,
+      face = "bold",
+      margin = margin(t = 8, b = 8)
+    ),
+
+    axis.title.x = element_text(
+      size = 19,
+      face = "bold",
+      margin = margin(t = 10)
+    ),
+    axis.title.y = element_text(
+      size = 19,
+      face = "bold",
+      margin = margin(r = 10)
+    ),
+
+    axis.text.x = element_text(
+      size = 16
+    ),
+    axis.text.y = element_text(
+      size = 16
+    ),
+
+    # More separation between subplots
+    panel.spacing = unit(1.5, "lines"),
+
+    plot.margin = margin(15, 25, 15, 15)
+  )
+
+horizon_beta_plot
+
+ggsave(
+  "change-in-beta.svg",
+  plot = horizon_beta_plot,
+  width = 18,
+  height = 8
+)
+```
+
+## 4.4 Early-versus-late persistence
+
+The descriptive persistence measure compares the average coefficient over horizons
+1--5 with the average over horizons 26--30:
+
+\[
+\bar{\beta}_{\text{early}} = \frac{1}{5}\sum_{h=1}^{5}\beta_h,
+\qquad
+\bar{\beta}_{\text{late}} = \frac{1}{5}\sum_{h=26}^{30}\beta_h,
+\qquad
+\Delta = \bar{\beta}_{\text{late}} - \bar{\beta}_{\text{early}}.
+\]
+
+A positive $\Delta$ means the coefficient becomes more positive at long horizons;
+a negative $\Delta$ means it becomes more negative. This calculation requires
+`MAX_HORIZON >= 30`.
+
+```{r persistence_summary}
+EARLY_HORIZONS <- 1:5
+LATE_HORIZONS <- 26:30
+
+stopifnot(all(c(EARLY_HORIZONS, LATE_HORIZONS) %in% HORIZONS))
+
+persistence_summary <- horizon_betas %>%
+  filter(horizon %in% c(EARLY_HORIZONS, LATE_HORIZONS)) %>%
+  mutate(
+    window = case_when(
+      horizon %in% EARLY_HORIZONS ~ "early",
+      horizon %in% LATE_HORIZONS ~ "late"
+    )
+  ) %>%
+  group_by(term, window) %>%
+  summarise(mean_beta = mean(estimate), .groups = "drop") %>%
+  pivot_wider(names_from = window, values_from = mean_beta) %>%
+  transmute(
+    predictor = unname(TERM_LABELS[term]),
+    beta_early = early,
+    beta_late = late,
+    delta = beta_late - beta_early
+  ) %>%
+  arrange(match(predictor, unname(TERM_LABELS[FACET_ORDER])))
+
+knitr::kable(
+  persistence_summary,
+  digits = 3,
+  col.names = c(
+    "Predictor", "Mean beta, h = 1--5",
+    "Mean beta, h = 26--30", "Delta (late - early)"
+  ),
+  caption = "Descriptive early-versus-late coefficient persistence"
+)
+```
+
+```{r persistence_interpretation, results='asis'}
+semantic_result <- persistence_summary %>%
+  filter(predictor == "Semantic Dispersion")
+degree_result <- persistence_summary %>%
+  filter(predictor == "Degree Centrality")
+betweenness_result <- persistence_summary %>%
+  filter(predictor == "Betweenness Centrality")
+
+cat(sprintf(
+  paste0(
+    "> Semantic dispersion changes from approximately %.2f at short horizons ",
+    "to %.2f at long horizons, while degree centrality changes from %.2f to %.2f ",
+    "and betweenness centrality remains positive (%.2f early and %.2f late).\n"
+  ),
+  semantic_result$beta_early,
+  semantic_result$beta_late,
+  degree_result$beta_early,
+  degree_result$beta_late,
+  betweenness_result$beta_early,
+  betweenness_result$beta_late
+))
+```
+
+### Joint Wald test
+
+The horizon-specific models reuse the same observations, so their coefficient estimates
+are correlated. Adding their separate standard errors would therefore give an invalid
+test. The model below stacks all horizons, interacts every predictor and fixed effect
+with horizon, and clusters by subreddit. Its covariance matrix supports the Wald test
+$H_0: \bar{\beta}_{\text{late}} = \bar{\beta}_{\text{early}}$.
+
+```{r joint_horizon_model}
+joint_horizon_data <- horizon_model_data %>%
+  mutate(
+    horizon_subreddit_time = interaction(
+      horizon, subreddit, time_idx, drop = TRUE
+    ),
+    horizon_slang = interaction(horizon, slang, drop = TRUE)
+  )
+
+joint_horizon_model <- fenegbin(
+  target_new_adopters_count ~
+    i(horizon, mean_betweenness) +
+    i(horizon, mean_degree) +
+    i(horizon, effective_topics) +
+    i(horizon, semantic_dispersion) |
+    horizon_subreddit_time + horizon_slang,
+  data = joint_horizon_data,
+  offset = ~log(eligible_user_exposure),
+  cluster = ~subreddit
+)
+```
+
+```{r persistence_wald_test}
+early_late_wald <- function(model, term, early_horizons, late_horizons) {
+  estimates <- coef(model)
+  covariance <- vcov(model)[names(estimates), names(estimates), drop = FALSE]
+
+  early_names <- paste0("horizon::", early_horizons, ":", term)
+  late_names <- paste0("horizon::", late_horizons, ":", term)
+  required_names <- c(early_names, late_names)
+  stopifnot(all(required_names %in% names(estimates)))
+
+  contrast <- setNames(rep(0, length(estimates)), names(estimates))
+  contrast[early_names] <- -1 / length(early_names)
+  contrast[late_names] <- 1 / length(late_names)
+
+  delta <- sum(contrast * estimates)
+  delta_se <- sqrt(drop(t(contrast) %*% covariance %*% contrast))
+  wald_chisq <- (delta / delta_se)^2
+
+  tibble(
+    term = term,
+    joint_beta_early = mean(estimates[early_names]),
+    joint_beta_late = mean(estimates[late_names]),
+    delta = delta,
+    std_error = delta_se,
+    wald_chisq = wald_chisq,
+    p_value = pchisq(wald_chisq, df = 1, lower.tail = FALSE)
+  )
+}
+
+persistence_wald <- map_dfr(
+  COVARIATES_RAW,
+  ~ early_late_wald(
+    joint_horizon_model, .x, EARLY_HORIZONS, LATE_HORIZONS
+  )
+) %>%
+  transmute(
+    predictor = unname(TERM_LABELS[term]),
+    joint_beta_early,
+    joint_beta_late,
+    delta,
+    std_error,
+    wald_chisq,
+    p_value
+  ) %>%
+  arrange(match(predictor, unname(TERM_LABELS[FACET_ORDER])))
+
+knitr::kable(
+  persistence_wald,
+  digits = 3,
+  col.names = c(
+    "Predictor", "Joint early beta", "Joint late beta", "Delta",
+    "SE(Delta)", "Wald chi-squared", "p-value"
+  ),
+  caption = "Joint Wald tests of equal early and late average coefficients"
+)
+```

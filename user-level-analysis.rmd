@@ -1,0 +1,212 @@
+---
+title: "user-level-analysis"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(survival)
+library(broom)
+```
+
+# Part 1 — Data Loading and Preprocessing
+
+## 1.1 Load data and inspect missingness
+
+```{r load}
+df <- read.csv("./user-level-df.csv")
+
+# FIX #3: report how many rows are lost to drop_na() before dropping,
+# so we know whether missingness is negligible or systematic.
+n_before <- nrow(df)
+df <- df %>% drop_na()
+n_after <- nrow(df)
+
+cat("Rows before drop_na():", n_before, "\n")
+cat("Rows after drop_na(): ", n_after, "\n")
+cat("Rows dropped:         ", n_before - n_after,
+    sprintf("(%.2f%%)", 100 * (n_before - n_after) / n_before), "\n")
+```
+
+## 1.2 Prepare covariates
+
+The data remain in start-stop (counting-process) form: each row represents one
+monthly risk interval. This allows the covariates, and their hazard ratios, to
+vary over time without treating the rows as independent survival records.
+
+Skewed covariates (`betweenness`, `mean_degree`, `effective_topics`) are
+log1p-transformed first, then all covariates are z-score standardized.
+Note: standardization is computed over all user-month rows, so long spells
+contribute more observations to the mean/sd (documented in Methods).
+
+```{r covariates}
+COVARIATES <- c(
+  "mean_degree", "betweenness", "semantic_dispersion", "effective_topics"
+)
+
+df_clean <- df %>%
+  mutate(
+    betweenness      = log1p(betweenness),
+    mean_degree      = log1p(mean_degree),
+    #effective_topics = log1p(effective_topics),
+    #semantic_dispersion = log1p(semantic_dispersion)
+  ) %>%
+  # Z-score normalize (after log transforms)
+  mutate(across(all_of(COVARIATES), ~ as.numeric(scale(.x))))
+
+head(df_clean)
+```
+
+## 1.3 Sanity check — risk-set integrity (FIX #2)
+
+Once a user adopts a term (event == 1), they must exit the risk set: no
+subsequent rows should exist for that user-term-subreddit-spell. This chunk
+verifies that, and removes any post-adoption rows if found.
+
+```{r risk-set-check}
+post_adoption_rows <- df_clean %>%
+  group_by(user, term, subreddit, spell_id) %>%
+  filter(any(event == 1)) %>%
+  mutate(first_event_stop = min(stop[event == 1])) %>%
+  ungroup() %>%
+  filter(start >= first_event_stop)
+
+cat("Rows occurring after adoption:", nrow(post_adoption_rows), "\n")
+
+# If any post-adoption rows exist, remove them so users exit the risk set
+# at adoption. (If spells are intentionally recurrent, revisit this choice
+# and the clustering structure instead of deleting rows.)
+if (nrow(post_adoption_rows) > 0) {
+  df_clean <- df_clean %>%
+    group_by(user, term, subreddit, spell_id) %>%
+    mutate(first_event_stop = if (any(event == 1)) min(stop[event == 1]) else Inf) %>%
+    ungroup() %>%
+    filter(start < first_event_stop) %>%
+    select(-first_event_stop)
+  cat("Post-adoption rows removed. Remaining rows:", nrow(df_clean), "\n")
+}
+```
+
+## 1.4 Descriptives of adoption times
+
+```{r adoption-times}
+adoption_times <- df_clean %>%
+  group_by(user, term, subreddit, spell_id) %>%
+  summarise(
+    adopted = any(event == 1),
+    adoption_time = if_else(adopted, min(stop[event == 1]), NA_real_),
+    .groups = "drop"
+  )
+
+adoption_times %>%
+  filter(adopted) %>%
+  summarise(
+    n_adoptions          = n(),
+    mean_adoption_time   = mean(adoption_time),
+    median_adoption_time = median(adoption_time),
+    sd_adoption_time     = sd(adoption_time)
+  )
+```
+
+```{r summary}
+summary(df_clean)
+```
+
+# Part 2 — Main Cox model
+
+```{r main-model}
+fit <- coxph(
+  Surv(start, stop, event) ~
+    mean_degree +
+    betweenness +
+    semantic_dispersion +
+    effective_topics,
+  cluster = user,
+  data = df_clean
+)
+
+summary(fit)
+tidy(fit, exponentiate = TRUE, conf.int = TRUE)  # hazard ratios
+```
+
+## 2.1 Proportional hazards check
+
+```{r zph}
+my_zph <- cox.zph(fit)
+my_zph
+```
+
+# Part 3 — Time-varying effect model (FIX #1)
+
+Because the data are already in counting-process form, we do NOT use `tt()`.
+Instead we construct the time interaction explicitly as an ordinary covariate:
+each row's interval endpoint (`stop`) provides the time value, so
+`betweenness * log(stop)` implements the same hypothesis as
+`tt(x) = x * log(t)` but is fully supported for start-stop data and
+reproducible. Only betweenness receives the interaction, since the PH
+violation for mean_degree was resolved by the log transform.
+
+```{r time-varying-model}
+df_clean <- df_clean %>%
+  mutate(betweenness_x_logt = betweenness * log(stop)) %>%
+  mutate(degree_x_logt = mean_degree * log(stop))
+
+fit_nonph <- coxph(
+  Surv(start, stop, event) ~
+    mean_degree +
+    betweenness +
+    betweenness_x_logt +
+    degree_x_logt + 
+    semantic_dispersion +
+    effective_topics,
+  cluster = user,
+  data = df_clean
+)
+
+summary(fit_nonph)
+tidy(fit_nonph, exponentiate = TRUE, conf.int = TRUE)  # hazard ratios
+```
+
+# Part 4 — Robustness: stratified models
+
+These models absorb all term-level and subreddit-level heterogeneity into
+stratum-specific baseline hazards. Semantic features are constant within a
+term, so they are only estimable in the unstratified models above; the
+stratified network model shows that network effects hold even after
+controlling for all slang- and community-level differences.
+
+## 4.1 Network features only, strata(term, subreddit)
+
+```{r network-strata}
+fit_network <- coxph(
+  Surv(start, stop, event) ~
+    mean_degree + betweenness + strata(term, subreddit),
+  cluster = user,
+  data = df_clean
+)
+
+summary(fit_network)
+tidy(fit_network, exponentiate = TRUE, conf.int = TRUE)
+```
+
+```{r network-strata-zph}
+cox.zph(fit_network)
+```
+
+## 4.2 Linguistic features only, strata(subreddit)
+
+Note: `strata(term)` would absorb the semantic features entirely (they are
+constant within each term), so the linguistic robustness model stratifies by
+subreddit only.
+
+```{r linguistic-strata}
+fit_linguistic <- coxph(
+  Surv(start, stop, event) ~
+    semantic_dispersion + effective_topics + strata(subreddit),
+  cluster = user,
+  data = df_clean
+)
+
+summary(fit_linguistic)
+tidy(fit_linguistic, exponentiate = TRUE, conf.int = TRUE)
+```
